@@ -130,6 +130,7 @@ export class ScreenShareSession {
   private qualityIndex = 1;
   private healthyQualitySamples = 0;
   private qualityMonitor: number | null = null;
+  private remoteLeaveTimer: number | null = null;
 
   constructor(roomId: string, peerId: string, displayName: string, events: SessionEvents) {
     this.roomId = roomId;
@@ -160,11 +161,11 @@ export class ScreenShareSession {
         this.events.onPeerCountChange(keys.length);
 
         const remoteKey = keys.find((key) => key !== this.peerId);
-        if (!remoteKey) {
-          if (this.remotePeerId) this.handleRemoteLeave();
-          return;
-        }
+        // Presence updates can briefly produce an incomplete sync snapshot.
+        // The explicit, debounced `leave` handler below decides real exits.
+        if (!remoteKey) return;
 
+        if (remoteKey === this.remotePeerId) this.cancelRemoteLeaveTimer();
         const presences = state[remoteKey] ?? [];
         const name = presences[0]?.displayName ?? 'Guest';
         this.registerRemotePeer(remoteKey, name, presences[0]?.isSharing);
@@ -175,14 +176,41 @@ export class ScreenShareSession {
 
         const name = (newPresences[0] as PresenceData | undefined)?.displayName ?? 'Guest';
         const isSharing = (newPresences[0] as PresenceData | undefined)?.isSharing;
+        if (key === this.remotePeerId) this.cancelRemoteLeaveTimer();
         log('Peer joined:', key, name);
         this.registerRemotePeer(key, name, isSharing);
         void this.maybeStartPeerConnection();
       })
       .on('presence', { event: 'leave' }, ({ key }) => {
         if (key !== this.remotePeerId) return;
-        log('Peer left:', key);
-        this.handleRemoteLeave();
+
+        this.cancelRemoteLeaveTimer();
+        this.remoteLeaveTimer = window.setTimeout(() => {
+          this.remoteLeaveTimer = null;
+          if (!this.channel || this.destroyed || key !== this.remotePeerId) return;
+
+          const state = this.channel.presenceState() as Record<string, PresenceData[]>;
+          if ((state[key]?.length ?? 0) > 0) return;
+
+          const replacementKey = Object.keys(state).find(
+            (candidate) => candidate !== this.peerId && candidate !== key,
+          );
+          log('Peer left:', key);
+          this.handleRemoteLeave();
+
+          // A fast refresh/reload can replace the same participant with a new
+          // peer id before the old leave event settles. Adopt that new id now
+          // instead of waiting for another presence event that may never come.
+          if (replacementKey) {
+            const replacement = state[replacementKey]?.[0];
+            this.registerRemotePeer(
+              replacementKey,
+              replacement?.displayName ?? 'Guest',
+              replacement?.isSharing,
+            );
+            void this.maybeStartPeerConnection();
+          }
+        }, 750);
       })
       .on('broadcast', { event: 'signal' }, ({ payload }) => {
         this.signalQueue = this.signalQueue
@@ -310,6 +338,7 @@ export class ScreenShareSession {
 
     if (this.remotePeerId && this.remotePeerId !== id) return;
 
+    const isNewPeer = this.remotePeerId !== id;
     this.remotePeerId = id;
     this.remotePeerName = displayName || 'Guest';
     if (typeof isSharing === 'boolean') {
@@ -323,6 +352,13 @@ export class ScreenShareSession {
     });
 
     this.publishRemoteStreamIfReady();
+
+    // A user may already be sharing before the other participant enters.
+    // Announce the active stream directly instead of relying only on the
+    // presence snapshot or on the first room-wide hello message.
+    if (isNewPeer && this.isLocalSharing()) {
+      void this.sendSignal(id, { type: 'sharing', active: true });
+    }
   }
 
   private async handleSignal(payload: WireSignal) {
@@ -395,7 +431,8 @@ export class ScreenShareSession {
 
           const answer = await this.pc.createAnswer();
           await this.pc.setLocalDescription(answer);
-          log('Sending answer');
+          await this.waitForIceGatheringComplete(this.pc);
+          log('Sending answer with gathered ICE candidates');
           await this.sendSignal(payload.from, {
             type: 'answer',
             sdp: this.pc.localDescription ?? answer,
@@ -459,6 +496,14 @@ export class ScreenShareSession {
     await this.ensurePeer();
     if (!this.pc) return;
 
+    // The permanent audio/video transceivers are negotiated when the peer is
+    // created. Starting a screen share only calls replaceTrack(), so creating
+    // another offer here would interrupt an already healthy connection.
+    if (this.pc.localDescription || this.pc.remoteDescription) {
+      if (this.pc.connectionState === 'connected') this.setStatus('connected');
+      return;
+    }
+
     this.setStatus('connecting');
 
     const shouldOffer = this.peerId.localeCompare(this.remotePeerId) < 0;
@@ -500,8 +545,10 @@ export class ScreenShareSession {
         }
       });
 
+      // A receiver track exists as soon as the permanent transceiver is
+      // negotiated, even when nobody is sharing. Never infer `isSharing`
+      // from ontrack/unmute; the explicit sharing signal is authoritative.
       track.addEventListener('unmute', () => this.publishRemoteStreamIfReady());
-
       this.publishRemoteStreamIfReady();
     };
 
@@ -581,7 +628,8 @@ export class ScreenShareSession {
     try {
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
-      log('Offer created and set as local description, sending to peer');
+      await this.waitForIceGatheringComplete(this.pc);
+      log('Offer created with gathered ICE candidates, sending to peer');
 
       await this.sendSignal(this.remotePeerId, {
         type: 'offer',
@@ -594,6 +642,27 @@ export class ScreenShareSession {
     } finally {
       this.makingOffer = false;
     }
+  }
+
+  private async waitForIceGatheringComplete(pc: RTCPeerConnection, timeoutMs = 5_000) {
+    if (pc.iceGatheringState === 'complete') return;
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        pc.removeEventListener('icegatheringstatechange', handleStateChange);
+        resolve();
+      };
+      const handleStateChange = () => {
+        if (pc.iceGatheringState === 'complete') finish();
+      };
+      const timeout = window.setTimeout(finish, timeoutMs);
+
+      pc.addEventListener('icegatheringstatechange', handleStateChange);
+    });
   }
 
   private async flushPendingCandidates() {
@@ -666,6 +735,20 @@ export class ScreenShareSession {
     this.healthyQualitySamples = 0;
     this.events.onQualityChange?.(QUALITY_PROFILES[this.qualityIndex].level);
 
+    const videoTrack = stream.getVideoTracks()[0];
+    videoTrack?.addEventListener(
+      'ended',
+      () => {
+        this.stopSharing();
+      },
+      { once: true },
+    );
+
+    // Update the interface and room state as soon as capture starts. Signaling
+    // can take several seconds on a poor network and must not hide the stream.
+    this.events.onLocalSharingChange(true);
+    void this.updatePresence();
+
     try {
       if (this.remotePeerId) {
         await this.ensurePeer();
@@ -674,23 +757,14 @@ export class ScreenShareSession {
         await this.sendSignal(this.remotePeerId, { type: 'sharing', active: true });
       }
 
-      this.events.onLocalSharingChange(true);
-      void this.updatePresence();
       if (this.status === 'connected') this.startQualityMonitor();
-
-      const videoTrack = stream.getVideoTracks()[0];
-      videoTrack?.addEventListener(
-        'ended',
-        () => {
-          this.stopSharing();
-        },
-        { once: true },
-      );
 
       return stream;
     } catch (error) {
       stream.getTracks().forEach((track) => track.stop());
       if (this.localStream === stream) this.localStream = null;
+      this.events.onLocalSharingChange(false);
+      void this.updatePresence();
       throw error;
     }
   }
@@ -916,6 +990,7 @@ export class ScreenShareSession {
   }
 
   private handleRemoteLeave() {
+    this.cancelRemoteLeaveTimer();
     log('Remote peer left');
     this.events.onRemotePeerUpdate(null);
     this.events.onRemoteStream(null);
@@ -948,6 +1023,12 @@ export class ScreenShareSession {
     this.remoteStream = new MediaStream();
   }
 
+  private cancelRemoteLeaveTimer() {
+    if (this.remoteLeaveTimer === null) return;
+    window.clearTimeout(this.remoteLeaveTimer);
+    this.remoteLeaveTimer = null;
+  }
+
   private setStatus(status: ConnectionStatus) {
     if (this.status === status || this.destroyed) return;
     this.status = status;
@@ -959,6 +1040,7 @@ export class ScreenShareSession {
     if (this.destroyed) return;
 
     log('Destroying session');
+    this.cancelRemoteLeaveTimer();
     if (this.remotePeerId) {
       this.sendSignal(this.remotePeerId, { type: 'leave' });
     }
