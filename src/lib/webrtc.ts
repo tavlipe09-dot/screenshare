@@ -412,20 +412,19 @@ export class ScreenShareSession {
         await this.ensurePeer();
         if (!this.pc) return;
 
-        const polite = this.peerId.localeCompare(payload.from) > 0;
         const offerCollision = this.makingOffer || this.pc.signalingState !== 'stable';
-        this.ignoreOffer = !polite && offerCollision;
 
-        if (this.ignoreOffer) {
-          log('Ignoring offer (glare resolution)');
+        // Only the deterministic offerer is allowed to create offers. If a
+        // stale/duplicate offer crosses an active negotiation, ignore it. A
+        // rollback here can reorder Chrome's transceivers and later produce
+        // "order of m-lines doesn't match" when screen sharing starts.
+        if (offerCollision) {
+          log('Ignoring offer received during an active negotiation');
           return;
         }
+        this.ignoreOffer = false;
 
         try {
-          if (offerCollision && this.pc.signalingState !== 'stable') {
-            await this.pc.setLocalDescription({ type: 'rollback' });
-          }
-
           await this.pc.setRemoteDescription(payload.sdp);
           await this.flushPendingCandidates();
 
@@ -478,6 +477,7 @@ export class ScreenShareSession {
 
       case 'sharing': {
         this.registerRemotePeer(payload.from, this.remotePeerName, payload.active);
+        if (payload.active) await this.maybeStartPeerConnection();
         break;
       }
 
@@ -492,6 +492,15 @@ export class ScreenShareSession {
 
   private async maybeStartPeerConnection() {
     if (!this.remotePeerId || this.destroyed) return;
+
+    // Presence/Supabase is enough to mark the room participants as connected.
+    // Creating an empty media negotiation here makes Chrome reuse transceivers
+    // with a different m-line order when sharing starts. Build the P2P media
+    // connection only when one side actually has a screen to transmit.
+    if (!this.isLocalSharing() && !this.remoteIsSharing) {
+      this.setStatus('connected');
+      return;
+    }
 
     await this.ensurePeer();
     if (!this.pc) return;
@@ -753,8 +762,8 @@ export class ScreenShareSession {
       if (this.remotePeerId) {
         await this.ensurePeer();
         await this.attachLocalStreamToReservedSenders();
-        await this.maybeStartPeerConnection();
         await this.sendSignal(this.remotePeerId, { type: 'sharing', active: true });
+        await this.maybeStartPeerConnection();
       }
 
       if (this.status === 'connected') this.startQualityMonitor();
